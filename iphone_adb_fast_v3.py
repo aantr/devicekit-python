@@ -47,7 +47,7 @@ class IPhoneADBFast:
         auto_start_video: bool = True,
         expected_video_fps: float = 30.0,
         socket_receive_buffer: int = 256 * 1024,
-        video_read_timeout: float = 2.0,
+        video_read_timeout: float = 5.0,
         auto_reset_backlog: bool = True,
         backlog_fps_factor: float = 1.60,
         backlog_grace_seconds: float = 1.50,

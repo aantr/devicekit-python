@@ -5,7 +5,7 @@ import cv2
 from iphone_adb_fast_v3 import IPhoneADBFast
 
 
-TARGET_FPS = 30.0
+TARGET_FPS = 60.0
 
 print("IMPORTANT:")
 print("  1. ios ui run devicekit must be running")
