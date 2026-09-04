@@ -1,0 +1,4 @@
+opencv-python
+av
+requests
+websocket-client
