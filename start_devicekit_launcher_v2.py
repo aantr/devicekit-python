@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 
 import argparse
+from dataclasses import dataclass
+import logging
+from logging.handlers import RotatingFileHandler
 import os
+from pathlib import Path
 import shutil
 import signal
 import subprocess
@@ -14,6 +18,20 @@ BUNDLE_ID = "com.xgame.devicekit-iosUITests.xctrunner"
 
 HOST_PORT = 12005
 PHONE_PORT = 12005
+LOG = logging.getLogger("devicekit_launcher")
+
+
+def configure_logging(log_file: str):
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    console = logging.StreamHandler(sys.stdout)
+    file_handler = RotatingFileHandler(
+        log_file, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+    )
+    LOG.setLevel(logging.INFO)
+    LOG.propagate = False
+    for handler in (console, file_handler):
+        handler.setFormatter(formatter)
+        LOG.addHandler(handler)
 
 
 def find_ios() -> str:
@@ -28,8 +46,9 @@ def find_ios() -> str:
 
 def stream_output(name: str, proc: subprocess.Popen):
     assert proc.stdout is not None
-    for line in proc.stdout:
-        print(f"[{name}] {line}", end="")
+    with proc.stdout:
+        for line in proc.stdout:
+            LOG.info("[%s] %s", name, line.rstrip())
 
 
 def start_process(
@@ -38,9 +57,7 @@ def start_process(
     *,
     new_session: bool = True,
 ) -> subprocess.Popen:
-    print()
-    print(f"Starting {name}:")
-    print("  " + " ".join(cmd))
+    LOG.info("Starting %s: %s", name, " ".join(cmd))
 
     proc = subprocess.Popen(
         cmd,
@@ -48,6 +65,7 @@ def start_process(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        errors="replace",
         bufsize=1,
         start_new_session=new_session,
     )
@@ -70,7 +88,7 @@ def stop_process(
     if proc is None or proc.poll() is not None:
         return
 
-    print(f"Stopping {name}...")
+    LOG.info("Stopping %s...", name)
 
     try:
         if process_group:
@@ -90,6 +108,7 @@ def stop_process(
                 proc.kill()
         except ProcessLookupError:
             pass
+        proc.wait()
 
 
 def check_process(
@@ -105,6 +124,72 @@ def check_process(
         )
 
 
+@dataclass
+class Service:
+    name: str
+    cmd: list[str]
+    startup_delay: float
+    new_session: bool = True
+    proc: subprocess.Popen | None = None
+
+
+def stop_services(services: list[Service]):
+    for service in reversed(services):
+        stop_process(
+            service.name, service.proc, process_group=service.new_session
+        )
+        service.proc = None
+
+
+def supervise(services: list[Service]):
+    """Keep retrying; restart dependants when their upstream service exits."""
+    retry_delay = 3
+    healthy_since = None
+    try:
+        while True:
+            for index, service in enumerate(services):
+                try:
+                    if service.proc is None:
+                        service.proc = start_process(
+                            service.name, service.cmd,
+                            new_session=service.new_session,
+                        )
+                        check_process(
+                            service.name, service.proc, service.startup_delay
+                        )
+                    rc = service.proc.poll()
+                    if rc is not None:
+                        raise RuntimeError(
+                            f"{service.name} stopped unexpectedly with exit code {rc}"
+                        )
+                except (OSError, RuntimeError) as exc:
+                    LOG.error("%s", exc)
+                    # Keep a healthy tunnel (and its sudo session) running when
+                    # only DeviceKit or the video forwarder needs recovery.
+                    stop_services(services[index:])
+                    LOG.warning(
+                        "Restarting %s and dependent services in %ss",
+                        service.name, retry_delay,
+                    )
+                    healthy_since = None
+                    time.sleep(retry_delay)
+                    retry_delay = min(retry_delay * 2, 30)
+                    break
+            else:
+                if healthy_since is None:
+                    healthy_since = time.monotonic()
+                    LOG.info("All services running. Press Ctrl+C to stop.")
+                elif time.monotonic() - healthy_since >= 60:
+                    retry_delay = 3
+                time.sleep(1)
+    finally:
+        stop_services(services)
+
+
+def request_stop(signum, frame):
+    raise KeyboardInterrupt
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Start go-ios tunnel + DeviceKit + H264 forward"
@@ -114,9 +199,15 @@ def main():
         action="store_true",
         help="Use go-ios userspace tunnel (no sudo required)",
     )
+    parser.add_argument(
+        "--log-file",
+        default=str(Path(__file__).with_suffix(".log")),
+        help="Rotating launcher and go-ios log file",
+    )
     args = parser.parse_args()
 
     ios = find_ios()
+    configure_logging(args.log_file)
 
     print("iPhone DeviceKit launcher")
     print("-------------------------")
@@ -128,46 +219,18 @@ def main():
     )
     print()
 
-    tunnel = None
-    devicekit = None
-    forward = None
-
     # tunnel is intentionally NOT put into a new session when sudo is used.
     # This keeps its controlling TTY, so sudo can authenticate normally.
-    tunnel_uses_process_group = args.userspace
+    if args.userspace:
+        tunnel_cmd = [ios, "tunnel", "start", "--userspace", "--udid", UDID]
+    else:
+        print("The tunnel command may ask for your macOS password.")
+        tunnel_cmd = ["sudo", ios, "tunnel", "start", "--udid", UDID]
 
-    try:
-        if args.userspace:
-            tunnel_cmd = [
-                ios,
-                "tunnel",
-                "start",
-                "--userspace",
-                "--udid",
-                UDID,
-            ]
-        else:
-            print("The tunnel command may ask for your macOS password.")
-            tunnel_cmd = [
-                "sudo",
-                ios,
-                "tunnel",
-                "start",
-                "--udid",
-                UDID,
-            ]
-
-        tunnel = start_process(
-            "tunnel",
-            tunnel_cmd,
-            new_session=args.userspace,
-        )
-        check_process("tunnel", tunnel, 1.2)
-
-        # Give RSD/CoreDevice time to become available.
-        time.sleep(1.5)
-
-        devicekit = start_process(
+    services = [
+        # Allow RSD/CoreDevice time to become available before starting DeviceKit.
+        Service("tunnel", tunnel_cmd, 2.7, new_session=args.userspace),
+        Service(
             "devicekit",
             [
                 ios,
@@ -179,13 +242,10 @@ def main():
                 "--udid",
                 UDID,
             ],
-        )
-        check_process("devicekit", devicekit, 1.2)
-
-        time.sleep(1.0)
-
-        forward = start_process(
-            "h264",
+            2.2,
+        ),
+        Service(
+            "h264 forward",
             [
                 ios,
                 "forward",
@@ -194,65 +254,22 @@ def main():
                 "--udid",
                 UDID,
             ],
-        )
-        check_process("h264 forward", forward, 0.8)
+            0.8,
+        ),
+    ]
 
-        print()
-        print("All services started.")
-        print()
-        print("DeviceKit RPC:")
-        print("  http://127.0.0.1:12004")
-        print()
-        print("ReplayKit H264:")
-        print(f"  tcp://127.0.0.1:{HOST_PORT}")
-        print()
-        print("Now start Screen Broadcast on the iPhone.")
-        print("Press Ctrl+C to stop everything.")
-        print()
-
-        while True:
-            for name, proc in [
-                ("tunnel", tunnel),
-                ("devicekit", devicekit),
-                ("h264 forward", forward),
-            ]:
-                rc = proc.poll()
-                if rc is not None:
-                    raise RuntimeError(
-                        f"{name} stopped unexpectedly "
-                        f"with exit code {rc}"
-                    )
-
-            time.sleep(1)
-
+    LOG.info("DeviceKit RPC: http://127.0.0.1:12004")
+    LOG.info("ReplayKit H264: tcp://127.0.0.1:%s", HOST_PORT)
+    LOG.info("Start Screen Broadcast on the iPhone once services are running.")
+    LOG.info("Automatic recovery enabled. Log: %s", args.log_file)
+    previous_sigterm = signal.signal(signal.SIGTERM, request_stop)
+    try:
+        supervise(services)
     except KeyboardInterrupt:
-        print()
-        print("Ctrl+C received.")
-
-    except Exception as exc:
-        print()
-        print(f"ERROR: {exc}")
-
+        LOG.info("Stop requested.")
     finally:
-        stop_process(
-            "h264 forward",
-            forward,
-            process_group=True,
-        )
-
-        stop_process(
-            "devicekit",
-            devicekit,
-            process_group=True,
-        )
-
-        stop_process(
-            "tunnel",
-            tunnel,
-            process_group=tunnel_uses_process_group,
-        )
-
-        print("Stopped.")
+        signal.signal(signal.SIGTERM, previous_sigterm)
+        LOG.info("Stopped.")
 
 
 if __name__ == "__main__":
