@@ -131,6 +131,7 @@ class Service:
     startup_delay: float
     new_session: bool = True
     proc: subprocess.Popen | None = None
+    started_at: float | None = None
 
 
 def stop_services(services: list[Service]):
@@ -139,6 +140,7 @@ def stop_services(services: list[Service]):
             service.name, service.proc, process_group=service.new_session
         )
         service.proc = None
+        service.started_at = None
 
 
 def supervise(services: list[Service]):
@@ -154,6 +156,7 @@ def supervise(services: list[Service]):
                             service.name, service.cmd,
                             new_session=service.new_session,
                         )
+                        service.started_at = time.monotonic()
                         check_process(
                             service.name, service.proc, service.startup_delay
                         )
@@ -164,16 +167,25 @@ def supervise(services: list[Service]):
                         )
                 except (OSError, RuntimeError) as exc:
                     LOG.error("%s", exc)
+                    if (
+                        service.started_at is not None
+                        and time.monotonic() - service.started_at > 3
+                    ):
+                        delay = 0
+                        retry_delay = 3
+                    else:
+                        delay = retry_delay
+                        retry_delay = min(retry_delay * 2, 30)
                     # Keep a healthy tunnel (and its sudo session) running when
                     # only DeviceKit or the video forwarder needs recovery.
                     stop_services(services[index:])
                     LOG.warning(
                         "Restarting %s and dependent services in %ss",
-                        service.name, retry_delay,
+                        service.name, delay,
                     )
                     healthy_since = None
-                    time.sleep(retry_delay)
-                    retry_delay = min(retry_delay * 2, 30)
+                    if delay:
+                        time.sleep(delay)
                     break
             else:
                 if healthy_since is None:
